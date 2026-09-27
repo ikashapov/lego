@@ -34,6 +34,10 @@ const (
 	EnvPollingInterval    = envNamespace + "POLLING_INTERVAL"
 )
 
+// maxPageSize is the maximum number of zones per page allowed by the Yandex Cloud DNS API.
+// https://yandex.cloud/en/docs/dns/api-ref/grpc/DnsZone/list
+const maxPageSize = 1000
+
 var _ challenge.ProviderTimeout = (*DNSProvider)(nil)
 
 // Config is used to configure the creation of the DNSProvider.
@@ -189,18 +193,30 @@ func (d *DNSProvider) Timeout() (timeout, interval time.Duration) {
 	return d.config.PropagationTimeout, d.config.PollingInterval
 }
 
-// getZones retrieves available zones from yandex cloud.
+// getZones retrieves all available zones from yandex cloud.
+// The API is paginated: a single List call returns only the first page of zones.
 func (d *DNSProvider) getZones(ctx context.Context) ([]*ycdnsproto.DnsZone, error) {
+	var zones []*ycdnsproto.DnsZone
+
 	list := &ycdnsproto.ListDnsZonesRequest{
 		FolderId: d.config.FolderID,
+		PageSize: maxPageSize,
 	}
 
-	response, err := d.client.List(ctx, list)
-	if err != nil {
-		return nil, errors.New("unable to fetch dns zones")
-	}
+	for {
+		response, err := d.client.List(ctx, list)
+		if err != nil {
+			return nil, fmt.Errorf("unable to fetch dns zones: %w", err)
+		}
 
-	return response.GetDnsZones(), nil
+		zones = append(zones, response.GetDnsZones()...)
+
+		if response.GetNextPageToken() == "" {
+			return zones, nil
+		}
+
+		list.PageToken = response.GetNextPageToken()
+	}
 }
 
 func (d *DNSProvider) upsertRecordSetData(ctx context.Context, zoneID, name, value string) error {

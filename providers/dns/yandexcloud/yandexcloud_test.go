@@ -1,11 +1,17 @@
 package yandexcloud
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"testing"
 
 	"github.com/go-acme/lego/v5/internal/tester"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	ycdnsproto "github.com/yandex-cloud/go-genproto/yandex/cloud/dns/v1"
+	ycdns "github.com/yandex-cloud/go-sdk/services/dns/v1"
+	"google.golang.org/grpc"
 )
 
 const envDomain = envNamespace + "DOMAIN"
@@ -136,6 +142,91 @@ func TestNewDNSProviderConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDNSProvider_getZones(t *testing.T) {
+	testCases := []struct {
+		desc     string
+		pages    map[string]*ycdnsproto.ListDnsZonesResponse
+		expected []string
+	}{
+		{
+			desc: "single page",
+			pages: map[string]*ycdnsproto.ListDnsZonesResponse{
+				"": {DnsZones: []*ycdnsproto.DnsZone{{Id: "a", Zone: "a.example."}}},
+			},
+			expected: []string{"a"},
+		},
+		{
+			desc: "multiple pages",
+			pages: map[string]*ycdnsproto.ListDnsZonesResponse{
+				"":   {DnsZones: []*ycdnsproto.DnsZone{{Id: "a"}, {Id: "b"}}, NextPageToken: "p2"},
+				"p2": {DnsZones: []*ycdnsproto.DnsZone{{Id: "c"}}, NextPageToken: "p3"},
+				"p3": {DnsZones: []*ycdnsproto.DnsZone{{Id: "d"}}},
+			},
+			expected: []string{"a", "b", "c", "d"},
+		},
+		{
+			desc: "empty",
+			pages: map[string]*ycdnsproto.ListDnsZonesResponse{
+				"": {},
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			client := &fakeDNSZoneClient{t: t, pages: test.pages}
+
+			p := &DNSProvider{client: client, config: &Config{FolderID: "folder_id"}}
+
+			zones, err := p.getZones(t.Context())
+			require.NoError(t, err)
+
+			var ids []string
+			for _, zone := range zones {
+				ids = append(ids, zone.GetId())
+			}
+
+			assert.Equal(t, test.expected, ids)
+			assert.Len(t, client.tokens, len(test.pages), "every page must be requested exactly once")
+		})
+	}
+}
+
+func TestDNSProvider_getZones_error(t *testing.T) {
+	client := &fakeDNSZoneClient{t: t, err: errors.New("boom")}
+
+	p := &DNSProvider{client: client, config: &Config{FolderID: "folder_id"}}
+
+	_, err := p.getZones(t.Context())
+	require.EqualError(t, err, "unable to fetch dns zones: boom")
+}
+
+// fakeDNSZoneClient implements only List; other methods of the interface are not needed by getZones.
+type fakeDNSZoneClient struct {
+	ycdns.DnsZoneClient
+
+	t      *testing.T
+	pages  map[string]*ycdnsproto.ListDnsZonesResponse
+	err    error
+	tokens []string
+}
+
+func (f *fakeDNSZoneClient) List(_ context.Context, req *ycdnsproto.ListDnsZonesRequest, _ ...grpc.CallOption) (*ycdnsproto.ListDnsZonesResponse, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	assert.Equal(f.t, "folder_id", req.GetFolderId())
+	assert.EqualValues(f.t, maxPageSize, req.GetPageSize())
+
+	f.tokens = append(f.tokens, req.GetPageToken())
+
+	resp, ok := f.pages[req.GetPageToken()]
+	require.Truef(f.t, ok, "unexpected page token %q", req.GetPageToken())
+
+	return resp, nil
 }
 
 func TestLivePresent(t *testing.T) {
